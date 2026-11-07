@@ -1,0 +1,1031 @@
+<?xml version='1.0' encoding='utf-8'?>
+<CheatTable CheatEngineTableVersion="49">
+  <CheatEntries>
+    <CheatEntry>
+      <ID>1</ID>
+      <Description>"=== FM27 Player Editor ==="</Description>
+      <Color>FFFF00</Color>
+      <GroupHeader>1</GroupHeader>
+      <CheatEntries>
+        <CheatEntry>
+          <ID>2</ID>
+          <Description>"Step 1: Scan players (do this first)"</Description>
+          <Color>FF4040</Color>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+-- FM27 layout, verified live 2026-11-07.
+-- Every db::ACTUAL_PLAYER object begins with the class vtable pointer, so a
+-- byte-scan for that pointer finds all of them. No root/vector offsets needed,
+-- which means this survives restarts and save reloads.
+--   object+0x000 = vtable, object+0x040 = name (u32 len + ASCII)
+--   person = object - 0x288 (most-derived offset, read from RTTI)
+--   person+0x15F = 54 attribute bytes (1..100), +0x264 CA (u16), +0x266 PA (u16)
+--   person+0x130 = TEAM, TEAM+0x30 = CLUB, CLUB+0xC0 = club name (u32 len + ASCII)
+--   person+0x150 = 15 position slots (1 = not natural, 20 = natural)
+--   person+0x2F0 = NATION, NATION+0x18 = nation name
+--   person+0x2C8 = cached full name. Only filled once the game has RENDERED the
+--     player (~33%), so it is useless for a squad you have not browsed yet.
+--   person+0x2D8 -&gt; node, node+0 -&gt; first name string   (~87% resolve)
+--   person+0x2E0 -&gt; node, node+0 -&gt; surname string      (~78% resolve)
+--     These two are the name DATABASE the game renders from, not the render
+--     cache, so they work for players never displayed on screen. Together they
+--     name 21,897 of 24,099 players (90.9%) vs 7,856 (32.6%) for the cache.
+-- Remaining fields that always resolve even with no name at all:
+--   club, nationality, birth year, position.
+-- Attach to fm.exe automatically if nothing (or the wrong thing) is attached, so
+-- forgetting to open the process just works.
+local base = 0
+if getOpenedProcessID() ~= 0 then base = getAddress("game_plugin.dll") or 0 end
+if base == 0 then
+  local pid = getProcessIDFromProcessName("fm.exe")
+  if not pid or pid == 0 then
+    showMessage("Football Manager is not running.\n\nStart fm.exe and load a save, then run Step 1 again.")
+    return
+  end
+  if getOpenedProcessID() ~= pid then openProcess(pid) end
+  base = getAddress("game_plugin.dll") or 0
+  if base == 0 then
+    showMessage("Attached to fm.exe but game_plugin.dll is not loaded yet.\n\nLoad a save, then run Step 1 again.")
+    return
+  end
+end
+local VT_PLAYER = base + 0x4D29758
+
+local function hexptr(v)
+  return string.format("%02X %02X %02X %02X %02X %02X %02X %02X",
+    v &amp; 0xFF, (v &gt;&gt; 8) &amp; 0xFF, (v &gt;&gt; 16) &amp; 0xFF, (v &gt;&gt; 24) &amp; 0xFF,
+    (v &gt;&gt; 32) &amp; 0xFF, (v &gt;&gt; 40) &amp; 0xFF, (v &gt;&gt; 48) &amp; 0xFF, (v &gt;&gt; 56) &amp; 0xFF)
+end
+
+local function strAt(p)
+  if not p or p &lt; 0x10000 or p &gt; 0x7FFFFFFFFFFF then return nil end
+  local ln = readInteger(p)
+  if not ln or ln &lt; 2 or ln &gt; 60 then return nil end
+  return readString(p + 4, ln)
+end
+
+-- 15 position slots at +0x150, 1 = not natural, 20 = natural. Verified against 20
+-- named players with known positions: 0 GK, 2 DL, 3 DC, 4 DR, 5 DM, 7 MC, 9 AML,
+-- 10 AMC, 11 AMR, 12 ST, 13 WBL, 14 WBR all correct. Slots 6 and 8 are the wide
+-- midfield pair (they never read 20); 1 is sweeper, always 1.
+local POS = {"GK","SW","DL","DC","DR","DM","MR","MC","ML","AML","AMC","AMR","ST","WBL","WBR"}
+local function posOf(p)
+  local best, bv = nil, 1
+  for i = 0, 14 do
+    local v = readByte(p + 0x150 + i) or 1
+    if v &gt; bv then bv, best = v, i end
+  end
+  return best and POS[best + 1] or "?"
+end
+
+local t = AOBScan(hexptr(VT_PLAYER), "+W-C")
+if t == nil then
+  showMessage("No player objects found.\n\nLoad a save first, then try again.")
+  return
+end
+-- name DB node: pointer at person+off, then node+0 is the string
+local function namePart(p, off)
+  local node = readPointer(p + off)
+  if not node or node &lt; 0x10000 or node &gt; 0x7FFFFFFFFFFF then return nil end
+  return strAt(readPointer(node))
+end
+
+local list = {}
+for i = 0, t.Count - 1 do
+  local person = getAddress(t[i]) - 0x288
+  local ca = readSmallInteger(person + 0x264)
+  local pa = readSmallInteger(person + 0x266)
+  if ca and pa and ca &gt; 0 and ca &lt;= 200 then
+    -- club is available for every player, unlike the lazily-loaded name
+    local team = readPointer(person + 0x130)
+    local club = team and readPointer(team + 0x30)
+    local cn = club and strAt(readPointer(club + 0xC0)) or nil
+    -- nation also resolves for players whose name was never loaded
+    local nation = readPointer(person + 0x2F0)
+    local first, last = namePart(person, 0x2D8), namePart(person, 0x2E0)
+    local full = (first and last) and (first .. " " .. last) or last or first
+    list[#list + 1] = {
+      p = person,
+      n = full or strAt(readPointer(person + 0x2C8)),
+      c = cn,
+      nat = nation and strAt(readPointer(nation + 0x18)) or nil,
+      y = readSmallInteger(person + 0x312),   -- birth year
+      pos = posOf(person),
+      ca = ca,
+      pa = pa,
+    }
+  end
+end
+t.destroy()
+_G.fm27Players = list
+local named, clubbed = 0, 0
+for i = 1, #list do
+  if list[i].n then named = named + 1 end
+  if list[i].c then clubbed = clubbed + 1 end
+end
+showMessage(string.format(
+  "%d players indexed.\n%d with names, %d with a club.\n\nNow run 'Step 2' and search by club or name.",
+  #list, named, clubbed))
+{$asm}
+
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+_G.fm27Players = nil
+{$asm}</AssemblerScript>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>3</ID>
+          <Description>"--- Step 2: choose a player ---"</Description>
+          <Color>C0C0C0</Color>
+          <GroupHeader>1</GroupHeader>
+          <Options moHideChildren="1" /><CheatEntries>
+            </CheatEntries>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>68</ID>
+          <Description>"Player Browser (click to open)"</Description>
+          <Color>00C0FF</Color>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+-- FM27 Player Browser: one persistent, closable window instead of a modal popup
+-- for every action. Filter by club or name, click a column header to sort,
+-- double-click a row to select it. The last club and selected player are
+-- remembered in %APPDATA%\FM27-Player-Editor.ini so nothing is retyped.
+
+local function iniPath()
+  return (os.getenv("APPDATA") or getTempFolder()) .. "\\FM27-Player-Editor.ini"
+end
+
+local function loadIni()
+  local t = {}
+  local f = io.open(iniPath(), "r")
+  if f then
+    for line in f:lines() do
+      local k, v = line:match("^([%w_]+)=(.*)$")
+      if k then t[k] = v end
+    end
+    f:close()
+  end
+  return t
+end
+
+local function saveIni(t)
+  local f = io.open(iniPath(), "w")
+  if not f then return end
+  for k, v in pairs(t) do f:write(k .. "=" .. v .. "\n") end
+  f:close()
+end
+
+if not _G.fm27Players or #_G.fm27Players == 0 then
+  showMessage("Run 'Step 1: Scan players' first.")
+  return
+end
+
+-- Bump when the window's construction changes, so a reload really rebuilds it
+-- instead of reopening the old form (which is only hidden, never freed).
+local BRVER = 2
+
+if _G.fm27Browser and _G.fm27BrowserVer == BRVER then
+  _G.fm27BrowserOpen(loadIni().club or "")
+  return
+end
+if _G.fm27Browser then
+  -- old build: hide it and fall through, otherwise its fixed border and old
+  -- column widths come back no matter what this script says
+  pcall(function() _G.fm27Browser.hide() end)
+  _G.fm27Browser = nil
+end
+
+local ini = loadIni()
+local form = createForm(true)
+form.DoNotSaveInTable = true
+-- createForm makes a fixed-size window; bsSizeable plus an explicit icon set
+-- gives it the normal resize edges, minimise and maximise buttons.
+form.BorderStyle = "bsSizeable"
+form.BorderIcons = "[biSystemMenu,biMinimize,biMaximize]"
+form.Caption = "FM27 Player Browser"
+form.Width = 800
+form.Height = 600
+form.Font.Name = "Segoe UI"
+form.Font.Size = 9
+form.centerScreen()
+-- X hides instead of destroying, so the global above stays usable
+form.setOnClose(function(sender) return caHide end)
+
+local lblFilter = createLabel(form)
+lblFilter.Caption = "Filter (club or name):"
+lblFilter.setPosition(8, 10)
+lblFilter.Width = 150
+
+local edit = createEdit(form)
+edit.setPosition(160, 7)
+edit.Width = 550
+edit.Text = ini.club or ""
+
+local btnFind = createButton(form)
+btnFind.Caption = "Find"
+btnFind.setPosition(718, 6)
+btnFind.Width = 70
+
+local lblInfo = createLabel(form)
+lblInfo.setPosition(8, 34)
+lblInfo.Width = 776
+lblInfo.Caption = ""
+
+-- A real list view gives proper columns. A list box cannot: string.format's
+-- padding counts BYTES, so an accented name (o-slash, ae) or any CJK name
+-- shifts every column after it.
+local lv = createListView(form)
+lv.setPosition(8, 56)
+lv.Width = 776
+lv.Height = 420
+lv.RowSelect = true
+lv.HideSelection = false
+lv.Font.Name = "Segoe UI"
+-- ReadOnly stops VCL's inline label editor: without it a double-click starts
+-- renaming a row instead of selecting the player.
+lv.ReadOnly = true
+
+-- Club is 70% of its old 350 so the window fits a laptop screen
+local COLS = { { "Name", 320 }, { "Club", 245 }, { "Pos", 42 },
+               { "Age", 50 }, { "CA", 45 }, { "PA", 45 } }
+local cols = lv.Columns
+for i = 1, #COLS do
+  local c = cols.add()
+  -- celua.txt calls this .Text, but the header caption is actually .Caption
+  c.Caption = COLS[i][1]
+  c.Width = COLS[i][2]
+end
+
+local btnSelect = createButton(form)
+btnSelect.Caption = "Select player"
+btnSelect.setPosition(8, 484)
+btnSelect.Width = 130
+
+local btnMine = createButton(form)
+btnMine.Caption = "My club only"
+btnMine.setPosition(146, 484)
+btnMine.Width = 110
+
+local btnAll = createButton(form)
+btnAll.Caption = "Show all"
+btnAll.setPosition(264, 484)
+btnAll.Width = 90
+
+local btnClip = createButton(form)
+btnClip.Caption = "Copy list"
+btnClip.setPosition(362, 484)
+btnClip.Width = 90
+
+local lblStatus = createLabel(form)
+lblStatus.setPosition(462, 488)
+lblStatus.Width = 320
+lblStatus.Caption = ""
+
+-- Bulk writes act on the row selected in the list, so no fm27Player symbol needed
+local btnBulkAttr = createButton(form)
+btnBulkAttr.Caption = "Bulk: all attributes"
+btnBulkAttr.setPosition(8, 512)
+btnBulkAttr.Width = 140
+
+local btnBulkCaPa = createButton(form)
+btnBulkCaPa.Caption = "Bulk: CA &amp; PA"
+btnBulkCaPa.setPosition(156, 512)
+btnBulkCaPa.Width = 110
+
+-- rows[] runs parallel to the list view, so a row index maps back to a player
+local rows = {}
+local total = #_G.fm27Players
+local sortCol, sortDesc = 0, false
+
+local function ageOf(x) return x.y and (2026 - x.y) or 0 end
+
+-- One comparator per column, always "a comes before b" for ascending order.
+local LESS = {
+  function(a, b) return (a.n or ""):lower() &lt; (b.n or ""):lower() end,
+  function(a, b) return (a.c or ""):lower() &lt; (b.c or ""):lower() end,
+  function(a, b) return (a.pos or "") &lt; (b.pos or "") end,
+  function(a, b) return ageOf(a) &lt; ageOf(b) end,
+  function(a, b) return (a.ca or 0) &lt; (b.ca or 0) end,
+  function(a, b) return (a.pa or 0) &lt; (b.pa or 0) end,
+}
+
+local function paintHeaders()
+  for i = 1, #COLS do
+    local c = cols.getColumn(i - 1)
+    if c then
+      c.Caption = COLS[i][1]
+      if i == sortCol then c.Caption = COLS[i][1] .. (sortDesc and " v" or " ^") end
+    end
+  end
+end
+
+local function resort()
+  if sortCol == 0 then return end
+  local less = LESS[sortCol]
+  if not less then return end
+  if sortDesc then
+    table.sort(rows, function(a, b) return less(b, a) end)
+  else
+    table.sort(rows, function(a, b) return less(a, b) end)
+  end
+end
+
+-- OwnerData virtual mode: CE calls this only for rows currently on screen,
+-- so filling 24k players costs nothing instead of ~11s of ListItems.add.
+lv.OwnerData = true
+lv.OnData = function(sender, it)
+  local x = rows[it.Index + 1]
+  if not x then return end
+  it.Caption = x.n or "(unnamed)"
+  local s = it.SubItems
+  s.clear()
+  s.add(x.c or "")
+  s.add(x.pos or "")
+  s.add(tostring(x.y and (2026 - x.y) or ""))
+  s.add(tostring(x.ca or ""))
+  s.add(tostring(x.pa or ""))
+end
+
+-- Bumped so shrinking from 24k rows to 30 cannot paint stale text.
+local function setCount(n)
+  if lv.Items.Count ~= 0 then lv.Items.Count = 0 end
+  lv.Items.Count = n
+end
+
+function _G.fm27BrowserFill(filter)
+  local list = _G.fm27Players or {}
+  filter = (filter or ""):lower()
+  total = #list
+  rows = {}
+  for i = 1, total do
+    local x = list[i]
+    if filter == "" or (x.c and x.c:lower():find(filter, 1, true))
+                     or (x.n and x.n:lower():find(filter, 1, true)) then
+      rows[#rows + 1] = x
+    end
+  end
+  resort()
+  setCount(#rows)
+  lv.refresh()
+  lblInfo.Caption = string.format("%d of %d players", #rows, total)
+  if #rows &gt; 0 then lv.setItemIndex(0) end
+end
+
+function _G.fm27BrowserSelect()
+  local i = lv.ItemIndex
+  if not i or i &lt; 0 or not rows[i + 1] then
+    lblStatus.Caption = "Pick a player first."
+    return
+  end
+  local x = rows[i + 1]
+  registerSymbol("fm27Player", x.p)
+  registerSymbol("fm27Person", x.p + 0x288)
+  saveIni({ club = edit.Text, player = string.format("%X", x.p),
+            name = x.n or "", clubname = x.c or "" })
+  lblStatus.Caption = "Selected " .. (x.n or "(unnamed)")
+  lblInfo.Caption = string.format("%d of %d players   |   person = %X", #rows, total, x.p)
+end
+
+local function refill()
+  -- only a non-empty filter is remembered, so 'Show all' does not wipe the club
+  if edit.Text ~= "" then
+    local t = loadIni()
+    t.club = edit.Text
+    saveIni(t)
+  end
+  _G.fm27BrowserFill(edit.Text)
+end
+btnFind.OnClick = function(sender) refill() end
+-- OnKeyPress swallows typed characters in CE; OnKeyDown does not
+edit.OnKeyDown = function(sender, vk)
+  if tostring(vk) == "13" then refill() end
+end
+btnAll.OnClick = function(sender) _G.fm27BrowserOpen("") end
+btnMine.OnClick = function(sender)
+  local t = loadIni()
+  local c = (t.clubname and t.clubname ~= "" and t.clubname) or t.club or ""
+  edit.Text = c
+  refill()
+end
+btnSelect.OnClick = function(sender) _G.fm27BrowserSelect() end
+
+-- Same offsets the CE menu bulk entries use, but aimed at the highlighted row.
+local function bulkTarget(title)
+  local i = lv.ItemIndex
+  if not i or i &lt; 0 or not rows[i + 1] then
+    showMessage("Pick a player in the list first.")
+    return nil
+  end
+  local x = rows[i + 1]
+  local cap = string.format("%s - %s", title, x.n or "(unnamed)")
+  return x.p, cap
+end
+
+btnBulkAttr.OnClick = function(sender)
+  local p, cap = bulkTarget("Set all attributes")
+  if not p then return end
+  local v = inputQuery(cap, "Value for all 54 attributes (1-100):", "100")
+  local n = tonumber(v or "")
+  if not n or n &lt; 1 or n &gt; 100 then return end
+  for k = 0, 53 do writeBytes(p + 0x15F + k, n) end
+  lblStatus.Caption = string.format("All 54 attributes = %d", n)
+end
+
+btnBulkCaPa.OnClick = function(sender)
+  local p, cap = bulkTarget("Set CA and PA")
+  if not p then return end
+  local caS = inputQuery(cap, "Current Ability (1-200):",
+                        tostring(readSmallInteger(p + 0x264) or 100))
+  if not caS then return end
+  local paS = inputQuery(cap, "Potential Ability (1-200):",
+                        tostring(readSmallInteger(p + 0x266) or 200))
+  if not paS then return end
+  local ca, pa = tonumber(caS), tonumber(paS)
+  if not ca or not pa or ca &lt; 1 or ca &gt; 200 or pa &lt; 1 or pa &gt; 200 then
+    showMessage("CA and PA must be 1..200.")
+    return
+  end
+  if ca &gt; pa then showMessage("CA cannot exceed PA.") return end
+  writeSmallInteger(p + 0x264, ca)
+  writeSmallInteger(p + 0x266, pa)
+  lblStatus.Caption = string.format("CA=%d PA=%d", ca, pa)
+end
+btnClip.OnClick = function(sender)
+  -- tab separated so it pastes straight into a spreadsheet
+  local out = { "Name\tClub\tPos\tAge\tCA\tPA" }
+  for i = 1, #rows do
+    local x = rows[i]
+    out[#out + 1] = string.format("%s\t%s\t%s\t%s\t%s\t%s",
+      x.n or "", x.c or "", x.pos or "", x.y and (2026 - x.y) or "",
+      x.ca or "", x.pa or "")
+  end
+  writeToClipboard(table.concat(out, "\r\n"))
+  lblStatus.Caption = string.format("Copied %d rows", #rows)
+end
+lv.OnDblClick = function(sender) _G.fm27BrowserSelect() end
+
+-- Reorder the already-filtered rows; no rescan, so 24k rows sort instantly.
+lv.OnColumnClick = function(sender, col)
+  local i = col.Index + 1
+  if i &lt; 1 or i &gt; #LESS then return end
+  if sortCol == i then sortDesc = not sortDesc else sortCol, sortDesc = i, false end
+  resort()
+  setCount(#rows)
+  paintHeaders()
+  lv.refresh()
+  if #rows &gt; 0 then lv.setItemIndex(0) end
+end
+
+-- Stretch the list with the window; keep the two button rows pinned to the
+-- bottom so nothing overlaps. OnChangeBounds is the documented Control event
+-- (celua.txt); a plain OnResize is not listed and may never fire.
+form.OnChangeBounds = function(sender)
+  local w, h = form.ClientWidth, form.ClientHeight
+  if not w or not h then return end
+  btnFind.Left = math.max(180, w - 82)
+  edit.Width = math.max(60, w - 250)
+  lblInfo.Width = math.max(80, w - 24)
+  lv.Width = math.max(80, w - 24)
+  lv.Height = math.max(60, h - 144)
+  local y = math.max(56, h - 76)
+  for _, b in ipairs({ btnSelect, btnMine, btnAll, btnClip }) do b.Top = y end
+  lblStatus.Top = y + 4
+  for _, b in ipairs({ btnBulkAttr, btnBulkCaPa }) do b.Top = y + 28 end
+end
+
+_G.fm27Browser = form
+_G.fm27BrowserVer = BRVER
+-- set the filter and refill together, so the box and the list never disagree
+function _G.fm27BrowserOpen(filter)
+  edit.Text = filter or ""
+  _G.fm27BrowserFill(edit.Text)
+  _G.fm27Browser.show()
+  _G.fm27Browser.bringToFront()
+end
+_G.fm27BrowserOpen(ini.club or "")
+lblStatus.Caption = (ini.name and ini.name ~= "") and ("Last: " .. ini.name) or ""
+{$asm}
+
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+-- Hide only. Destroying it here would leave the global dangling and any pending
+-- callback would touch freed memory.
+if _G.fm27Browser then _G.fm27Browser.hide() end
+{$asm}</AssemblerScript>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>5</ID>
+          <Description>"--- Step 3: selected player CA / PA ---"</Description>
+          <Color>C0C0C0</Color>
+          <GroupHeader>1</GroupHeader>
+          <Options moHideChildren="1" /><CheatEntries>
+            <CheatEntry>
+              <ID>6</ID>
+              <Description>"CA (Current Ability)"</Description>
+              <Color>00FF00</Color>
+              <VariableType>2 Bytes</VariableType>
+              <Address>fm27Player+264</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>7</ID>
+              <Description>"PA (Potential Ability)"</Description>
+              <Color>00FF00</Color>
+              <VariableType>2 Bytes</VariableType>
+              <Address>fm27Player+266</Address>
+            </CheatEntry>
+          </CheatEntries>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>8</ID>
+          <Description>"--- Step 4: attributes (1-100) ---"</Description>
+          <Color>C0C0C0</Color>
+          <GroupHeader>1</GroupHeader>
+          <Options moHideChildren="1" /><CheatEntries>
+            <CheatEntry>
+              <ID>10</ID>
+              <Description>"Crossing"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+15F</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>11</ID>
+              <Description>"Dribbling"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+160</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>12</ID>
+              <Description>"Finishing"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+161</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>13</ID>
+              <Description>"Heading"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+162</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>14</ID>
+              <Description>"Long Shots"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+163</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>15</ID>
+              <Description>"Marking"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+164</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>16</ID>
+              <Description>"Off The Ball"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+165</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>17</ID>
+              <Description>"Passing"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+166</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>18</ID>
+              <Description>"Penalty Taking"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+167</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>19</ID>
+              <Description>"Tackling"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+168</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>20</ID>
+              <Description>"Vision"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+169</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>21</ID>
+              <Description>"Handling"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+16A</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>22</ID>
+              <Description>"Aerial Reach"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+16B</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>23</ID>
+              <Description>"Command Of Area"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+16C</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>24</ID>
+              <Description>"Communication"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+16D</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>25</ID>
+              <Description>"Kicking"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+16E</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>26</ID>
+              <Description>"Throwing"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+16F</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>27</ID>
+              <Description>"Anticipation"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+170</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>28</ID>
+              <Description>"Decision"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+171</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>29</ID>
+              <Description>"One On Ones"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+172</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>30</ID>
+              <Description>"Positioning"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+173</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>31</ID>
+              <Description>"Reflexes"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+174</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>32</ID>
+              <Description>"First Touch"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+175</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>33</ID>
+              <Description>"Technique"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+176</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>34</ID>
+              <Description>"Left Foot"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+177</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>35</ID>
+              <Description>"Right Foot"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+178</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>36</ID>
+              <Description>"Flair"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+179</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>37</ID>
+              <Description>"Corners"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+17A</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>38</ID>
+              <Description>"Teamwork"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+17B</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>39</ID>
+              <Description>"Work Rate"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+17C</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>40</ID>
+              <Description>"Long Throws"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+17D</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>41</ID>
+              <Description>"Eccentricity"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+17E</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>42</ID>
+              <Description>"Rushing Out (Tendency)"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+17F</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>43</ID>
+              <Description>"Punching (Tendency)"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+180</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>44</ID>
+              <Description>"Acceleration"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+181</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>45</ID>
+              <Description>"Free Kick Taking"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+182</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>46</ID>
+              <Description>"Strength"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+183</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>47</ID>
+              <Description>"Stamina"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+184</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>48</ID>
+              <Description>"Pace"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+185</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>49</ID>
+              <Description>"Jumping Reach"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+186</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>50</ID>
+              <Description>"Leadership"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+187</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>51</ID>
+              <Description>"Dirtiness"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+188</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>52</ID>
+              <Description>"Balance"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+189</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>53</ID>
+              <Description>"Bravery"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+18A</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>54</ID>
+              <Description>"Consistency"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+18B</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>55</ID>
+              <Description>"Aggression"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+18C</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>56</ID>
+              <Description>"Agility"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+18D</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>57</ID>
+              <Description>"Imp. Matches"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+18E</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>58</ID>
+              <Description>"Injury Proneness"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+18F</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>59</ID>
+              <Description>"Versatility"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+190</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>60</ID>
+              <Description>"Natural Fitness"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+191</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>61</ID>
+              <Description>"Determination"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+192</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>62</ID>
+              <Description>"Composure"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+193</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>63</ID>
+              <Description>"Concentration"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+194</Address>
+            </CheatEntry>
+          </CheatEntries>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>70</ID>
+          <Description>"--- Step 5: personality (1-20) ---"</Description>
+          <Color>C0C0C0</Color>
+          <GroupHeader>1</GroupHeader>
+          <Options moHideChildren="1" /><CheatEntries>
+            <CheatEntry>
+              <ID>100</ID>
+              <Description>"Adaptability"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+2F8</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>101</ID>
+              <Description>"Ambition"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+2F9</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>102</ID>
+              <Description>"Loyalty"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+2FA</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>103</ID>
+              <Description>"Pressure"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+2FB</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>104</ID>
+              <Description>"Professionalism"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+2FC</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>105</ID>
+              <Description>"Sportsmanship"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+2FD</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>106</ID>
+              <Description>"Temperament"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+2FE</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>107</ID>
+              <Description>"Controversy"</Description>
+              <VariableType>Byte</VariableType>
+              <Address>fm27Player+2FF</Address>
+            </CheatEntry>
+          </CheatEntries>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>71</ID>
+          <Description>"--- Step 6: height &amp; birth year ---"</Description>
+          <Color>C0C0C0</Color>
+          <GroupHeader>1</GroupHeader>
+          <Options moHideChildren="1" /><CheatEntries>
+            <CheatEntry>
+              <ID>108</ID>
+              <Description>"Height (cm)"</Description>
+              <VariableType>2 Bytes</VariableType>
+              <Address>fm27Player+22E</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>109</ID>
+              <Description>"Birth Year"</Description>
+              <VariableType>2 Bytes</VariableType>
+              <Address>fm27Player+312</Address>
+            </CheatEntry>
+          </CheatEntries>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>72</ID>
+          <Description>"--- Step 7: reputation (labels unverified) ---"</Description>
+          <Color>C0C0C0</Color>
+          <GroupHeader>1</GroupHeader>
+          <Options moHideChildren="1" /><CheatEntries>
+            <CheatEntry>
+              <ID>110</ID>
+              <Description>"Reputation 1"</Description>
+              <VariableType>2 Bytes</VariableType>
+              <Address>fm27Player+25E</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>111</ID>
+              <Description>"Reputation 2"</Description>
+              <VariableType>2 Bytes</VariableType>
+              <Address>fm27Player+260</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>112</ID>
+              <Description>"Reputation 3"</Description>
+              <VariableType>2 Bytes</VariableType>
+              <Address>fm27Player+262</Address>
+            </CheatEntry>
+          </CheatEntries>
+        </CheatEntry>
+        <CheatEntry><ID>113</ID><Description>"--- Step 8: position rating (20 = natural) ---"</Description><Color>FFFF00</Color><GroupHeader>1</GroupHeader><Options moHideChildren="1" /><CheatEntries><CheatEntry><ID>114</ID><Description>"GK"</Description><VariableType>Byte</VariableType><Address>fm27Player+150</Address></CheatEntry><CheatEntry><ID>115</ID><Description>"SW"</Description><VariableType>Byte</VariableType><Address>fm27Player+151</Address></CheatEntry><CheatEntry><ID>116</ID><Description>"DL"</Description><VariableType>Byte</VariableType><Address>fm27Player+152</Address></CheatEntry><CheatEntry><ID>117</ID><Description>"DC"</Description><VariableType>Byte</VariableType><Address>fm27Player+153</Address></CheatEntry><CheatEntry><ID>118</ID><Description>"DR"</Description><VariableType>Byte</VariableType><Address>fm27Player+154</Address></CheatEntry><CheatEntry><ID>119</ID><Description>"DM"</Description><VariableType>Byte</VariableType><Address>fm27Player+155</Address></CheatEntry><CheatEntry><ID>120</ID><Description>"MR"</Description><VariableType>Byte</VariableType><Address>fm27Player+156</Address></CheatEntry><CheatEntry><ID>121</ID><Description>"MC"</Description><VariableType>Byte</VariableType><Address>fm27Player+157</Address></CheatEntry><CheatEntry><ID>122</ID><Description>"ML"</Description><VariableType>Byte</VariableType><Address>fm27Player+158</Address></CheatEntry><CheatEntry><ID>123</ID><Description>"AML"</Description><VariableType>Byte</VariableType><Address>fm27Player+159</Address></CheatEntry><CheatEntry><ID>124</ID><Description>"AMC"</Description><VariableType>Byte</VariableType><Address>fm27Player+15A</Address></CheatEntry><CheatEntry><ID>125</ID><Description>"AMR"</Description><VariableType>Byte</VariableType><Address>fm27Player+15B</Address></CheatEntry><CheatEntry><ID>126</ID><Description>"ST"</Description><VariableType>Byte</VariableType><Address>fm27Player+15C</Address></CheatEntry><CheatEntry><ID>127</ID><Description>"WBL"</Description><VariableType>Byte</VariableType><Address>fm27Player+15D</Address></CheatEntry><CheatEntry><ID>128</ID><Description>"WBR"</Description><VariableType>Byte</VariableType><Address>fm27Player+15E</Address></CheatEntry></CheatEntries></CheatEntry><CheatEntry><ID>129</ID><Description>"--- Bulk edits (act on selected player) ---"</Description><Options moHideChildren="1" /><Color>00FF7F</Color><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry>
+          <ID>64</ID>
+          <Description>"Bulk: set all attributes to a value"</Description>
+          <Color>FF8000</Color>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local ok, p = pcall(getAddress, "fm27Player")
+if not ok or not p or p == 0 then showMessage("Find a player first (Step 2).") return end
+local v = inputQuery("Set all attributes", "Value for all 54 attributes (1-100):", "100")
+if not v then return end
+local n = tonumber(v)
+if not n or n &lt; 1 or n &gt; 100 then showMessage("Value must be 1..100.") return end
+for k = 0, 53 do writeBytes(p + 0x15F + k, n) end
+showMessage(string.format("All 54 attributes set to %d.", n))
+{$asm}
+
+[DISABLE]
+{$asm}</AssemblerScript>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>65</ID>
+          <Description>"Bulk: set CA and PA"</Description>
+          <Color>FF8000</Color>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local ok, p = pcall(getAddress, "fm27Player")
+if not ok or not p or p == 0 then showMessage("Find a player first (Step 2).") return end
+local caS = inputQuery("Set CA", "Current Ability (1-200):", tostring(readSmallInteger(p + 0x264) or 100))
+if not caS then return end
+local paS = inputQuery("Set PA", "Potential Ability (1-200):", tostring(readSmallInteger(p + 0x266) or 200))
+if not paS then return end
+local ca, pa = tonumber(caS), tonumber(paS)
+if not ca or not pa or ca &lt; 1 or ca &gt; 200 or pa &lt; 1 or pa &gt; 200 then
+  showMessage("CA and PA must be 1..200.") return
+end
+if ca &gt; pa then showMessage("CA cannot exceed PA.") return end
+writeSmallInteger(p + 0x264, ca)
+writeSmallInteger(p + 0x266, pa)
+showMessage(string.format("Set CA=%d PA=%d.", ca, pa))
+{$asm}
+
+[DISABLE]
+{$asm}</AssemblerScript>
+        </CheatEntry>
+      </CheatEntries></CheatEntry></CheatEntries>
+    </CheatEntry>
+  </CheatEntries>
+  <UserdefinedSymbols />
+</CheatTable>
