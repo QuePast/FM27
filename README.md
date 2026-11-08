@@ -73,7 +73,3 @@ Known limitation: the game may recompute some attributes from CA when it re-eval
 FM27 does not expose a per-player "role" (Channel Midfielder, Playmaking Midfielder, etc.) as a readable field the way positions are exposed, so roles are not editable in this table. The position ratings in Step 8 are what the game actually stores.
 
 The Step 7 reputation labels are unverified — the three values exist at fixed offsets but I could not confirm which is current, potential and world reputation.
-
-## Credits
-
-Built by **Rajovan** ([github.com/quepast](https://github.com/quepast)).
